@@ -1,4 +1,4 @@
-# solana-zk-proof-example
+# solana-zk-proof
 
 ## Overview
 
@@ -128,271 +128,110 @@ This proof generation step would typically be performed by a party who has some 
 ### Beyond a reasonable doubt...the burden of proof
 
 Nice, we have a proof. Now how do we prove this thing? If you aren't in a compute constrained environment then it's relatively straight forward.
+# solana-zk-proof-example
 
-```rust
-let result = Groth16::<Bn254>::verify(&verifying_key, &[Fr::from(100)], &proof).unwrap();
+## Overview
+
+This repository contains a concise, practical example of generating a Groth16 ZK-SNARK proof using Arkworks and verifying that proof on Solana using the chain's pairing primitives (alt_bn128 pairing).
+
+The project demonstrates the end-to-end flow:
+
+- Generate a circuit and produce a proof (off-chain).
+- Convert and serialize proof and verifying key material to the format expected by Solana.
+- Verify the proof on-chain using Solana's pairing syscall.
+
+Goals:
+
+- Provide a reference implementation for Groth16 proof generation and Solana-compatible verification.
+- Show how to prepare keys, serialize points, and handle endianness for Solana.
+- Offer a minimal on-chain verifier that uses `alt_bn128_pairing` for efficient verification.
+
+## Repository layout
+
+- `on-chain-program-example/` — Solana program code (Rust) that implements the verifier and example instruction handling.
+- `proof-verify/` — Tools and examples for generating proofs, converting verifying keys, and preparing serialized inputs.
+- `README.md` — This document.
+
+## Requirements
+
+- Rust (stable). Install from https://www.rust-lang.org/tools/install
+- `cargo` (comes with Rust)
+- Solana CLI and `solana-test-validator` — for local testing and deploying the program: https://docs.solana.com/cli
+- `arkworks` crates (used in code; managed via Cargo.toml in subprojects)
+
+Note: The commands below assume a POSIX-like shell or PowerShell on Windows. Adjust paths accordingly if required.
+
+## Quickstart
+
+1. Start a local Solana validator:
+
+```powershell
+solana-test-validator
 ```
 
-The ark library has a handy function that will prepare the verifying key and public input for you and return a bool (true if valid, false otherwise). But this won't run on-chain as it uses too much CU. Long story short we need to use the alt_bn128_pairing function provided by Solana.
-The function essentially checks if a set of pairing products equals 1. If the pairing check passes (result is 1), it typically means the proof is valid.
-This allows Solana to support cryptographic operations necessary for using zero-knowledge proofs. We'll have to get into the weeds a little bit here in order to understand what we do next.
+2. Build and deploy the on-chain program (from the `proof-verify` folder in this project):
 
-- Input Validation: The function first checks if the input length is a multiple of a specific pairing element length. If not, it returns an error.
-- Data Preparation:
-  - It calculates how many pairing elements are in the input.
-  - It creates a vector to store pairs of points (G1 and G2) from the input data.
-- Parsing Input: 
-  - The function loops through the input data, parsing it into pairs of G1 and G2 points.
-  - It uses helper functions (convert_endianness_64 and convert_endianness_128) to handle endianness conversion.
-  - The parsed points are converted into the appropriate internal representations (PodG1 and PodG2).
-- Pairing Computation: It uses the multi_pairing function from the ark_bn254 library to compute the pairing of all the point pairs.
-- Result Processing: If the result of the pairing is equal to one (in the Fq12 field), it sets the result to 1. Otherwise, it remains 0.
-- Output: The result (0 or 1) is converted to a big-endian byte representation and returned.
-
-What's we want to focus on is [endianess](https://developer.mozilla.org/en-US/docs/Glossary/Endianness). This is crucial to validating the proof correctly. 
-
-We need to get data from our verifying key, proof and public inputs into the alt_bn128_pairing parameter:
-
-```rust
-input: &[u8]
+```powershell
+cd proof-verify
+cargo build-bpf
+solana program deploy .\target\deploy\solana_zk_example.so
 ```
 
-First we need to negate 'a' in the proof. The negation of the 'a' component in the Groth16 proof is an optimization that's commonly used in the verification process and many implementations of Groth16 verifiers expect the 'a' component to be negated.
+3. Update the program ID in the example `on-chain-program-example` code (if required). Then build and run tests for the on-chain example:
 
-```rust
-let proof_with_neg_a = Proof::<Bn254> {
-    a: proof.a.neg(),
-    b: proof.b,
-    c: proof.c,
-};
-let mut proof_bytes = Vec::with_capacity(proof_with_neg_a.serialized_size(Compress::No));
-proof_with_neg_a
-    .serialize_uncompressed(&mut proof_bytes)
-    .expect("Error serializing proof");
+```powershell
+cd ..\on-chain-program-example
+cargo build
+cargo test
 ```
 
-The proof components (a, b, c) are serialized and their endianness is converted in order to match Solana.
+Replace any example program IDs in source files with the ID returned by `solana program deploy`.
 
-```rust
-let proof_a: [u8; 64] = convert_endianness::<32, 64>(proof_bytes[0..64].try_into().unwrap());
-let proof_b: [u8; 128] = convert_endianness::<64, 128>(proof_bytes[64..192].try_into().unwrap());
-let proof_c: [u8; 64] = convert_endianness::<32, 64>(proof_bytes[192..256].try_into().unwrap());
-```
+## Key concepts (brief)
 
-Now we need to prepare our public input (represented as points on an elliptic curve) We use arks prepare_inputs which takes the public input (the number 100) and combines it with information from the verifying key to create a point on the elliptic curve. This point is then converted into a series of bytes. Finally, these bytes are reordered to match Solana.
+- Circuit: A set of arithmetic constraints describing the statement being proven.
+- Proving key / verifying key: Circuit-specific parameters produced in a trusted setup step for Groth16.
+- Proof: A short cryptographic object (A, B, C) proving the witness satisfies the circuit.
+- Verification on Solana: Convert proof and verifying key material into byte arrays (G1/G2 points) with correct endianness and call `alt_bn128_pairing`.
 
-```rust
-let projective: G1Projective = prepare_inputs(&vk, &[Fr::from(100)]).unwrap();
-let mut g1_bytes = Vec::with_capacity(projective.serialized_size(Compress::No));
-projective.serialize_uncompressed(&mut g1_bytes).expect("");
-let prepared_public_input =
-    convert_endianness::<32, 64>(<&[u8; 64]>::try_from(g1_bytes.as_slice()).unwrap());
-```
+Important implementation details in this repo:
 
-We'll convert the Arkworks verifying key to a stripped down version that's more efficient for Solana.
-It will extract the four parts we need for proof verification with prepared inputs, convert each part into bytes and change the endianness for Solana.
+- Endianness conversion: Solana expects a different byte order for curve coordinates than some libraries — consistent conversion is required.
+- Negating `A` (the `a` component): Many Groth16 verification implementations expect `A` to be negated as part of the standard pairing equation rearrangement.
+- Ordering of pairing inputs: The pairing syscall expects inputs in the order aligned with the Groth16 verification equation — correctness depends on precise ordering.
 
+## Where to look in the code
 
-```rust
+- `proof-verify/src/` — proof generation, key conversion, serialization helpers, and examples generating the prepared inputs for the on-chain verifier.
+- `on-chain-program-example/src/` — Solana program demonstrating how to deserialize the prepared verifier and call `alt_bn128_pairing`.
 
-pub fn convert_arkworks_verifying_key_to_solana_verifying_key_prepared(
-    ark_vk: &VerifyingKey<Bn254>,
-) -> Box<Groth16VerifyingKeyPrepared> {
-    // Convert alpha_g1
-    let mut vk_alpha_g1 = [0u8; 64];
-    ark_vk
-        .alpha_g1
-        .serialize_uncompressed(&mut vk_alpha_g1[..])
-        .unwrap();
+Search for these symbols in the codebase if you need to follow the flow:
 
-    // Convert beta_g2
-    let mut vk_beta_g2 = [0u8; 128];
-    ark_vk
-        .beta_g2
-        .serialize_uncompressed(&mut vk_beta_g2[..])
-        .unwrap();
+- `convert_arkworks_verifying_key_to_solana_verifying_key_prepared` — converting Arkworks VK to Solana-ready bytes.
+- `prepare_inputs` / `prepare_public_input` — combines public inputs into a G1 point used on-chain.
+- `Groth16VerifierPrepared::verify` — builds pairing input and calls `alt_bn128_pairing`.
 
-    // Convert gamma_g2
-    let mut vk_gamma_g2 = [0u8; 128];
-    ark_vk
-        .gamma_g2
-        .serialize_uncompressed(&mut vk_gamma_g2[..])
-        .unwrap();
+## Development notes
 
-    // Convert delta_g2
-    let mut vk_delta_g2 = [0u8; 128];
-    ark_vk
-        .delta_g2
-        .serialize_uncompressed(&mut vk_delta_g2[..])
-        .unwrap();
+- Tests: See `on-chain-program-example/src/main.rs` for pairing-related tests (for example `test_alt_bn128_pairing_custom`). These help validate byte formats and pairing logic against known-good results.
+- Debugging: Log intermediate serialized points and parsed G1/G2 values when debugging mismatches between off-chain verification (Arkworks) and on-chain checks.
 
-    let vk_alpha_g1_converted = convert_endianness::<32, 64>(&vk_alpha_g1);
-    let vk_beta_g2_converted = convert_endianness::<64, 128>(&vk_beta_g2);
-    let vk_gamma_g2_converted = convert_endianness::<64, 128>(&vk_gamma_g2);
-    let vk_delta_g2_converted = convert_endianness::<64, 128>(&vk_delta_g2);
+## Suggested next steps / improvements
 
-    Box::new(Groth16VerifyingKeyPrepared {
-        vk_alpha_g1: vk_alpha_g1_converted,
-        vk_beta_g2: vk_beta_g2_converted,
-        vk_gamma_g2: vk_gamma_g2_converted,
-        vk_delta_g2: vk_delta_g2_converted,
-    })
-}
-```
+- Add an automated script to generate verifying keys and write the prepared verifying key to a file that the on-chain program can read during deployment/initialization.
+- Add CI to build both crates and run core tests.
+- Add additional example circuits that exercise more realistic constraints.
 
-Finally, we can create our verifier! This is what will be sent to the Solana program and executed on-chain.
+## Resources
 
-```rust
-let mut verifier: Groth16VerifierPrepared = Groth16VerifierPrepared::new(
-    proof_a,
-    proof_b,
-    proof_c,
-    prepared_public_input,
-    groth_vk_prepared,
-)
-.unwrap();
-```
+- Arkworks: https://github.com/arkworks-rs
+- Solana developer docs: https://docs.solana.com
+- Example projects using Groth16 on Solana: Lightprotocol (https://github.com/Lightprotocol/groth16-solana)
 
-Now we have these two structs:
+## Contributing
 
-```rust
-#[derive(PartialEq, Eq, Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct Groth16VerifyingKeyPrepared {
-    pub vk_alpha_g1: [u8; 64],
-    pub vk_beta_g2: [u8; 128],
-    pub vk_gamma_g2: [u8; 128],
-    pub vk_delta_g2: [u8; 128],
-}
+Contributions are welcome. Please open issues or pull requests for bugs, improvements, or documentation enhancements.
 
-#[derive(PartialEq, Eq, Debug, Clone, BorshSerialize, BorshDeserialize)]
-pub struct Groth16VerifierPrepared {
-    proof_a: [u8; 64],
-    proof_b: [u8; 128],
-    proof_c: [u8; 64],
-    prepared_public_inputs: [u8; 64],
-    verifying_key: Box<Groth16VerifyingKeyPrepared>,
-}
-```
+## License
 
-The Groth16VerifierPrepared has a verify function that we can call on-chain. This will create the pairing input and pass it to alt_bn128_pairing.
-
-```rust
-impl Groth16VerifierPrepared {
-    pub fn verify(&mut self) -> Result<bool, Groth16Error> {
-        let pairing_input = [
-            self.proof_a.as_slice(),
-            self.proof_b.as_slice(),
-            self.prepared_public_inputs.as_slice(),
-            self.verifying_key.vk_gamma_g2.as_slice(),
-            self.proof_c.as_slice(),
-            self.verifying_key.vk_delta_g2.as_slice(),
-            self.verifying_key.vk_alpha_g1.as_slice(),
-            self.verifying_key.vk_beta_g2.as_slice(),
-        ]
-        .concat();
-
-        let pairing_res =
-            alt_bn128_pairing(pairing_input.as_slice()).map_err(|_| ProofVerificationFailed)?;
-
-        if pairing_res[31] != 1 {
-            return Err(ProofVerificationFailed);
-        }
-        Ok(true)
-    }
-}
-```
-
-The ordering of the pairing inputs matters and follows a specific mathematical structure designed for the Groth16 proof system. Let's break down the reason for this order:
-
-- [self.proof_a, self.proof_b]: These represent the main components of the proof. They're put first because they're the core elements that the verifier needs to check.
-- [self.prepared_public_inputs, self.verifying_key.vk_gamma_g2]: This pairing checks the validity of the public inputs against the γ (gamma) element of the verifying key.
-- [self.proof_c, self.verifying_key.vk_delta_g2]: This pairing involves the C component of the proof and the δ (delta) element of the verifying key. It's part of ensuring the proof's consistency.
-- [self.verifying_key.vk_alpha_g1, self.verifying_key.vk_beta_g2]: This final pairing checks the α (alpha) and β (beta) elements of the verifying key. It's crucial for the overall security of the proof system.
-
-The order corresponds to the Groth16 verification equation, which can be represented as:
-```
-e(A, B) · e(L, γ) · e(C, δ) = e(α, β) · e(K, γ)
-```
-Where:
-
-- A, B, C are from the proof
-- L represents the prepared public inputs
-- α, β, γ, δ are from the verifying key
-- K is a computation involving the public inputs and verifying key (prepared earlier)
-
-By arranging the inputs in this specific order, the pairing function can efficiently compute:
-```
-e(A, B) · e(L, γ) · e(C, δ) · e(-α, β)^-1
-```
-If this equals 1, it means the original equation holds, and the proof is valid.
-
-Now we are all set! Let's take a look on how we might use this in a Solana program:
-
-```rust
-
-// Program's entrypoint
-entrypoint!(process_instruction);
-
-// Define the instruction enum
-#[derive(BorshSerialize, BorshDeserialize)]
-pub enum ProgramInstruction {
-    VerifyProof(Groth16VerifierPrepared),
-}
-
-pub fn process_instruction(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    instruction_data: &[u8],
-) -> ProgramResult {
-    let instruction = ProgramInstruction::try_from_slice(instruction_data)?;
-
-    match instruction {
-        ProgramInstruction::VerifyProof(proof_package) => {
-            verify_proof(program_id, accounts, proof_package)
-        }
-    }
-}
-
-fn verify_proof(
-    _program_id: &Pubkey,
-    _accounts: &[AccountInfo],
-    mut groth16_verifier_prepared: Groth16VerifierPrepared,
-) -> ProgramResult {
-
-    let result = groth16_verifier_prepared
-        .verify()
-        .expect("Error deserializing verifier");
-
-    if result {
-        msg!("Proof is valid! Inputs verified.");
-        update_on_chain_state()?;
-        Ok(())
-    } else {
-        msg!("Proof is invalid!");
-        Err(ProgramError::InvalidAccountData.into())
-    }
-}
-
-fn update_on_chain_state() -> ProgramResult {
-    msg!("Updating state account.");
-
-    // Put what action you want to perform based on a successful verification
-
-    Ok(())
-}
-```
-
-### Random take aways:
-
-See the test "test_alt_bn128_pairing_custom" in main.rs for an example just using pairs not derived from a proof. This could be a good starting place if you are new.
-
-- Input format and endianness are important when dealing with cryptographic functions, especially when working with different libraries or implementations.
-- Detailed debugging output is invaluable in understanding how data is being processed and transformed at each step.
-- Verifying intermediate results (like the parsed G1 and G2 points) can help catch issues early in the process.
-- Comparing the results with a known-good implementation (like the Arkworks pairing check we kept in the test) provides a useful sanity check.
-
-### Other sources to check out
-
-[Risc Zero - Solana] (https://github.com/risc0/risc0-solana/tree/main)
-
-[LightProtocol Groth16 Solana] (https://github.com/Lightprotocol/groth16-solana)
+This repository is licensed under the terms in `LICENSE`.

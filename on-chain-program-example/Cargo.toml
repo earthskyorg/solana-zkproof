@@ -1,5 +1,5 @@
 [package]
-name = "solana-zk-client-example"
+name = "solana-zk-proof"
 version = "0.1.0"
 edition = "2021"
 
